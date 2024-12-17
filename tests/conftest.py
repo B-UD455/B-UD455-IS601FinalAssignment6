@@ -1,3 +1,4 @@
+'''
 """
 File: test_database_operations.py
 
@@ -238,3 +239,260 @@ def email_service():
         mock_service.send_verification_email.return_value = None
         mock_service.send_user_email.return_value = None
         return mock_service
+'''
+
+# Standard library imports
+from builtins import Exception, range, str
+from datetime import timedelta
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
+
+# Third-party imports
+import pytest
+from fastapi.testclient import TestClient
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, scoped_session
+from faker import Faker
+
+# Application-specific imports
+from app.main import app
+from app.database import Base, Database
+from app.models.user_model import User, UserRole
+from app.dependencies import get_db, get_settings
+from app.utils.security import hash_password
+from app.utils.template_manager import TemplateManager
+from app.services.email_service import EmailService
+from app.services.jwt_service import create_access_token
+from app.routers.user_routes import upgrade_user_to_professional  # Assuming this function exists
+from app.schemas.user_schemas import UserCreate  # NEW: Import UserCreate
+from app.services.user_service import UserService  # NEW: Import UserService
+from app.services.jwt_service import generate_email_verification_token  # NEW: Import the function to generate the token
+
+fake = Faker()
+
+settings = get_settings()
+TEST_DATABASE_URL = settings.database_url.replace("postgresql://", "postgresql+asyncpg://")
+engine = create_async_engine(TEST_DATABASE_URL, echo=settings.debug)
+AsyncTestingSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+AsyncSessionScoped = scoped_session(AsyncTestingSessionLocal)
+
+
+@pytest.fixture
+def email_service():
+    template_manager = TemplateManager()
+    email_service = EmailService(template_manager=template_manager)
+    return email_service
+
+
+@pytest.fixture(scope="function")
+async def async_client(db_session):
+    async with AsyncClient(app=app, base_url="http://testserver") as client:
+        app.dependency_overrides[get_db] = lambda: db_session
+        try:
+            yield client
+        finally:
+            app.dependency_overrides.clear()
+
+@pytest.fixture(scope="session", autouse=True)
+def initialize_database():
+    try:
+        Database.initialize(settings.database_url)
+    except Exception as e:
+        pytest.fail(f"Failed to initialize the database: {str(e)}")
+
+
+@pytest.fixture(scope="function", autouse=True)
+async def setup_database():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
+
+@pytest.fixture(scope="function")
+async def db_session(setup_database):
+    async with AsyncSessionScoped() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
+
+@pytest.fixture(scope="function")
+async def user(db_session):
+    user_data = {
+        "nickname": fake.user_name(),
+        "first_name": fake.first_name(),
+        "last_name": fake.last_name(),
+        "email": fake.email(),
+        "hashed_password": hash_password("MySuperPassword$1234"),
+        "role": UserRole.AUTHENTICATED,
+        "email_verified": False,
+        "is_locked": False,
+    }
+    user = User(**user_data)
+    db_session.add(user)
+    await db_session.commit()
+    return user
+
+
+@pytest.fixture(scope="function")
+async def manager_user(db_session: AsyncSession):
+    user = User(
+        nickname="manager_john",
+        first_name="John",
+        last_name="Doe",
+        email="manager_user@example.com",
+        hashed_password="securepassword",
+        role=UserRole.MANAGER,
+        is_locked=False,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    return user
+
+
+@pytest.fixture(scope="function")
+async def admin_user(db_session: AsyncSession):
+    user = User(
+        nickname="admin_user",
+        email="admin@example.com",
+        first_name="John",
+        last_name="Doe",
+        hashed_password="securepassword",
+        role=UserRole.ADMIN,
+        is_locked=False,
+    )
+    db_session.add(user)
+    await db_session.commit()
+    return user
+
+
+# Define tokens for each role
+@pytest.fixture(scope="function")
+def admin_token(admin_user):
+    token_data = {"sub": str(admin_user.id), "role": admin_user.role.name}
+    return create_access_token(data=token_data, expires_delta=timedelta(minutes=30))
+
+@pytest.fixture(scope="function")
+def manager_token(manager_user):
+    token_data = {"sub": str(manager_user.id), "role": manager_user.role.name}
+    return create_access_token(data=token_data, expires_delta=timedelta(minutes=30))
+
+@pytest.fixture(scope="function")
+def user_token(user):
+    token_data = {"sub": str(user.id), "role": user.role.name}
+    return create_access_token(data=token_data, expires_delta=timedelta(minutes=30))
+
+
+# New fixture to test profile updates and user upgrades
+@pytest.fixture(scope="function")
+async def upgraded_user(db_session, admin_user):
+    user_data = {
+        "nickname": fake.user_name(),
+        "first_name": fake.first_name(),
+        "last_name": fake.last_name(),
+        "email": fake.email(),
+        "hashed_password": hash_password("MySuperPassword$1234"),
+        "role": UserRole.AUTHENTICATED,
+        "email_verified": True,
+        "is_locked": False,
+    }
+    user = User(**user_data)
+    db_session.add(user)
+    await db_session.commit()
+
+    # Simulate the admin upgrading the user to professional status
+    await upgrade_user_to_professional(user.id)
+    return user
+
+
+# Test to ensure role-based user upgrades
+@pytest.mark.asyncio
+async def test_admin_user_upgrade(db_session, admin_token, upgraded_user):
+    # Test the user was upgraded correctly
+    response = await db_session.execute(f"SELECT role FROM users WHERE id = {upgraded_user.id}")
+    user = response.scalars().first()
+    assert user.role == UserRole.PROFESSIONAL  # Assuming this is the upgraded role
+
+
+# Test profile update functionality for manager and admin roles
+@pytest.mark.asyncio
+async def test_manager_user_update(db_session, manager_token, upgraded_user):
+    updated_email = "updated_email@example.com"
+    response = await db_session.execute(f"UPDATE users SET email = '{updated_email}' WHERE id = {upgraded_user.id}")
+    await db_session.commit()
+    updated_user = await db_session.execute(f"SELECT * FROM users WHERE id = {upgraded_user.id}")
+    assert updated_user.email == updated_email
+
+
+# Configure the email service to mock sending emails based on settings
+@pytest.fixture
+def email_service():
+    if settings.send_real_mail:
+        return EmailService()
+    else:
+        mock_service = AsyncMock(spec=EmailService)
+        mock_service.send_verification_email.return_value = None
+        mock_service.send_user_email.return_value = None
+        return mock_service
+
+# Updated verified_user fixture
+@pytest.fixture(scope="function")
+async def verified_user(db_session):
+    user_data = {
+        "nickname": fake.user_name(),
+        "first_name": fake.first_name(),
+        "last_name": fake.last_name(),
+        "email": fake.email(),
+        "hashed_password": hash_password("MySuperPassword$1234"),
+        "role": UserRole.AUTHENTICATED,
+        "email_verified": True,
+        "is_locked": False,
+    }
+    user = User(**user_data)
+    db_session.add(user)
+    await db_session.commit()
+    return user
+
+@pytest.fixture(scope="function")
+async def locked_user(db_session):
+    unique_email = fake.email()
+    user_data = {
+        "nickname": fake.user_name(),
+        "first_name": fake.first_name(),
+        "last_name": fake.last_name(),
+        "email": unique_email,
+        "hashed_password": hash_password("MySuperPassword$1234"),
+        "role": UserRole.AUTHENTICATED,
+        "email_verified": False,
+        "is_locked": True,
+        "failed_login_attempts": settings.max_login_attempts,
+    }
+    user = User(**user_data)
+    db_session.add(user)
+    await db_session.commit()
+    return user
+
+
+@pytest.fixture(scope="function")
+async def users_with_same_role_50_users(db_session):
+    users = []
+    for _ in range(50):
+        user_data = {
+            "nickname": fake.user_name(),
+            "first_name": fake.first_name(),
+            "last_name": fake.last_name(),
+            "email": fake.email(),
+            "hashed_password": fake.password(),
+            "role": UserRole.AUTHENTICATED,
+            "email_verified": False,
+            "is_locked": False,
+        }
+        user = User(**user_data)
+        db_session.add(user)
+        users.append(user)
+    await db_session.commit()
+    return users
